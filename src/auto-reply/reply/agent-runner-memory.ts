@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { estimateMessagesTokens } from "../../agents/compaction.js";
@@ -23,21 +24,24 @@ import {
 } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
+import { appendFileWithinRoot } from "../../infra/fs-safe.js";
 import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
-import type { GetReplyOptions } from "../types.js";
+import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import {
   buildEmbeddedRunExecutionParams,
   resolveModelFallbackOptions,
 } from "./agent-runner-utils.js";
 import {
   hasAlreadyFlushedForCurrentCompaction,
+  MEMORY_FLUSH_APPEND_BLOCK_PREFIX,
   resolveMemoryFlushContextWindowTokens,
   resolveMemoryFlushRelativePathForRun,
   resolveMemoryFlushPromptForRun,
   resolveMemoryFlushSettings,
   shouldRunMemoryFlush,
 } from "./memory-flush.js";
+import { normalizeReplyPayload } from "./normalize-reply.js";
 import { refreshQueuedFollowupSession, type FollowupRun } from "./queue.js";
 import { incrementCompactionCount } from "./session-updates.js";
 
@@ -76,6 +80,86 @@ export type SessionTranscriptUsageSnapshot = {
 // transcript reads in time to flip memory-flush gating when needed.
 const TRANSCRIPT_OUTPUT_READ_BUFFER_TOKENS = 8192;
 const TRANSCRIPT_TAIL_CHUNK_BYTES = 64 * 1024;
+
+type MemoryFlushFileSnapshot = {
+  exists: boolean;
+  size?: number;
+  mtimeMs?: number;
+};
+
+async function getMemoryFlushFileSnapshot(params: {
+  workspaceDir: string;
+  relativePath: string;
+}): Promise<MemoryFlushFileSnapshot> {
+  try {
+    const stat = await fs.promises.stat(path.join(params.workspaceDir, params.relativePath));
+    return { exists: true, size: stat.size, mtimeMs: stat.mtimeMs };
+  } catch {
+    return { exists: false };
+  }
+}
+
+function didMemoryFlushFileChange(
+  before: MemoryFlushFileSnapshot,
+  after: MemoryFlushFileSnapshot,
+): boolean {
+  if (before.exists !== after.exists) {
+    return true;
+  }
+  if (!before.exists && !after.exists) {
+    return false;
+  }
+  return before.size !== after.size || before.mtimeMs !== after.mtimeMs;
+}
+
+type MemoryFlushPayloadResolution =
+  | { kind: "no_reply" }
+  | { kind: "append_text"; text: string }
+  | { kind: "invalid" };
+
+function extractMemoryFlushAppendText(text: string): string | null {
+  const normalized = normalizeReplyPayload({ text });
+  const cleaned = normalized?.text?.trim() ?? "";
+  if (!cleaned) {
+    return null;
+  }
+  if (!cleaned.startsWith(MEMORY_FLUSH_APPEND_BLOCK_PREFIX)) {
+    return null;
+  }
+  const body = cleaned.slice(MEMORY_FLUSH_APPEND_BLOCK_PREFIX.length).trim();
+  return body || null;
+}
+
+function resolveMemoryFlushPayload(
+  payloads: ReplyPayload[] | undefined,
+): MemoryFlushPayloadResolution {
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    return { kind: "no_reply" };
+  }
+
+  if (payloads.some((payload) => payload?.isError)) {
+    return { kind: "invalid" };
+  }
+
+  const visibleTexts = payloads
+    .filter((payload) => !payload?.isReasoning)
+    .map((payload) => payload?.text?.trim() ?? "")
+    .filter((value) => value.length > 0);
+
+  if (visibleTexts.length === 0) {
+    return { kind: "no_reply" };
+  }
+
+  const appendTexts = visibleTexts
+    .map((text) => extractMemoryFlushAppendText(text))
+    .filter((value): value is string => Boolean(value));
+
+  if (appendTexts.length === 0) {
+    return { kind: "no_reply" };
+  }
+
+  return { kind: "append_text", text: appendTexts.join("\n\n") };
+}
 
 function parseUsageFromTranscriptLine(line: string): ReturnType<typeof normalizeUsage> | undefined {
   const trimmed = line.trim();
@@ -478,18 +562,28 @@ export async function runMemoryFlushIfNeeded(params: {
     .join("\n\n");
   let postCompactionSessionId: string | undefined;
   try {
+    let memoryFlushCompleted = false;
     await runWithModelFallback({
       ...resolveModelFallbackOptions(params.followupRun.run),
       runId: flushRunId,
       run: async (provider, model, runOptions) => {
+        const flushRun = {
+          ...params.followupRun.run,
+          verboseLevel: "off" as const,
+          reasoningLevel: "off" as const,
+        };
         const { embeddedContext, senderContext, runBaseParams } = buildEmbeddedRunExecutionParams({
-          run: params.followupRun.run,
+          run: flushRun,
           sessionCtx: params.sessionCtx,
           hasRepliedRef: params.opts?.hasRepliedRef,
           provider,
           model,
           runId: flushRunId,
           allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
+        });
+        const beforeSnapshot = await getMemoryFlushFileSnapshot({
+          workspaceDir: params.followupRun.run.workspaceDir,
+          relativePath: memoryFlushWritePath,
         });
         const result = await runEmbeddedPiAgent({
           ...embeddedContext,
@@ -516,6 +610,32 @@ export async function runMemoryFlushIfNeeded(params: {
             }
           },
         });
+        const afterSnapshot = await getMemoryFlushFileSnapshot({
+          workspaceDir: params.followupRun.run.workspaceDir,
+          relativePath: memoryFlushWritePath,
+        });
+        const persistedViaLegacyWrite = didMemoryFlushFileChange(beforeSnapshot, afterSnapshot);
+        const payload = resolveMemoryFlushPayload(result.payloads);
+        if (persistedViaLegacyWrite) {
+          memoryFlushCompleted = true;
+        } else if (payload.kind === "no_reply") {
+          memoryFlushCompleted = true;
+        } else if (payload.kind === "append_text") {
+          try {
+            await appendFileWithinRoot({
+              rootDir: params.followupRun.run.workspaceDir,
+              relativePath: memoryFlushWritePath,
+              data: payload.text,
+              mkdir: true,
+              prependNewlineIfNeeded: true,
+            });
+            memoryFlushCompleted = true;
+          } catch (err) {
+            logVerbose(`memory flush append skipped after model output: ${String(err)}`);
+          }
+        } else {
+          logVerbose("memory flush produced no appendable payload; leaving flush state retryable");
+        }
         if (result.meta?.agentMeta?.sessionId) {
           postCompactionSessionId = result.meta.agentMeta.sessionId;
         }
@@ -559,7 +679,7 @@ export async function runMemoryFlushIfNeeded(params: {
         memoryFlushCompactionCount = nextCount;
       }
     }
-    if (params.storePath && params.sessionKey) {
+    if (memoryFlushCompleted && params.storePath && params.sessionKey) {
       try {
         const updatedEntry = await updateSessionStoreEntry({
           storePath: params.storePath,

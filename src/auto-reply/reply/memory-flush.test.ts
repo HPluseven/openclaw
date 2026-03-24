@@ -56,6 +56,15 @@ describe("DEFAULT_MEMORY_FLUSH_PROMPT", () => {
     expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain("do not overwrite");
   });
 
+  it("tells the model to generate only new appendable content", () => {
+    expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain(
+      "Generate ONLY the new durable memory content to append",
+    );
+    expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain(
+      "do not restate, reconstruct, or rewrite existing file contents",
+    );
+  });
+
   it("includes anti-fragmentation instruction to prevent timestamped variant files (#34919)", () => {
     // Agents must not create YYYY-MM-DD-HHMM.md variants alongside the canonical file
     expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain("timestamped variant");

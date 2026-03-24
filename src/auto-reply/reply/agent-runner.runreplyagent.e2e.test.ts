@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import type { SessionEntry } from "../../config/sessions.js";
 import * as sessions from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
+import * as fsSafe from "../../infra/fs-safe.js";
 import { withStateDirEnv } from "../../test-helpers/state-dir-env.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions } from "../types.js";
@@ -101,6 +102,7 @@ beforeEach(() => {
   vi.mocked(enqueueFollowupRun).mockClear();
   vi.mocked(refreshQueuedFollowupSession).mockClear();
   vi.mocked(scheduleFollowupDrain).mockClear();
+  vi.restoreAllMocks();
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
 });
 
@@ -1943,6 +1945,554 @@ describe("runReplyAgent memory flush", () => {
       expect(await normalizeComparablePath(stored[sessionKey].sessionFile)).toBe(
         await normalizeComparablePath(path.join(path.dirname(storePath), "session-rotated.jsonl")),
       );
+    });
+  });
+
+  it("preserves legacy custom prompts that rely on canonical append-only writes", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      const calls: Array<{ prompt?: string; memoryFlushWritePath?: string }> = [];
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.memoryFlushWritePath) {
+          calls.push({ prompt: params.prompt, memoryFlushWritePath: params.memoryFlushWritePath });
+          const targetPath = path.join(workspaceDir, params.memoryFlushWritePath);
+          await fs.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.writeFile(targetPath, "legacy write path content", "utf-8");
+          return {
+            payloads: [],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: {
+          workspaceDir,
+          config: {
+            agents: {
+              defaults: {
+                compaction: {
+                  memoryFlush: {
+                    enabled: true,
+                    prompt: "legacy custom flush prompt: call write on memory/YYYY-MM-DD.md",
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(calls[0]?.memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, calls[0]?.memoryFlushWritePath ?? "");
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe("legacy write path content");
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeTypeOf("number");
+    });
+  });
+
+  it("does not double-append when the legacy write path already persisted the flush", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+      const appendSpy = vi.spyOn(fsSafe, "appendFileWithinRoot");
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          const targetPath = path.join(workspaceDir, params.memoryFlushWritePath!);
+          await fs.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.writeFile(targetPath, "legacy write path content", "utf-8");
+          return {
+            payloads: [],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(appendSpy).not.toHaveBeenCalled();
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe("legacy write path content");
+    });
+  });
+
+  it("does not append generic final summary text after a legacy write already persisted the memory", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+      const appendSpy = vi.spyOn(fsSafe, "appendFileWithinRoot");
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          const targetPath = path.join(workspaceDir, params.memoryFlushWritePath!);
+          await fs.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.writeFile(targetPath, "legacy write path content", "utf-8");
+          return {
+            payloads: [{ text: "Done." }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(appendSpy).not.toHaveBeenCalled();
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe("legacy write path content");
+    });
+  });
+
+  it("strips trailing NO_REPLY from dedicated runtime append payloads", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          return {
+            payloads: [{ text: "MEMORY_FLUSH_APPEND:\n- durable line\n\nNO_REPLY" }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe("- durable line");
+    });
+  });
+
+  it("appends memory flush payload text to the canonical daily memory file", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          const targetPath = path.join(workspaceDir, params.memoryFlushWritePath!);
+          await fs.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.writeFile(targetPath, "existing line", "utf-8");
+          return {
+            payloads: [{ text: "MEMORY_FLUSH_APPEND:\n- 2026-03-24: durable note" }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe(
+        "existing line\n- 2026-03-24: durable note",
+      );
+    });
+  });
+
+  it("does not modify the daily memory file when flush output is NO_REPLY", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          return {
+            payloads: [{ text: "NO_REPLY" }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.stat(targetPath)).rejects.toThrow();
+    });
+  });
+
+  it("fails closed when flush payloads are error-only", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          const targetPath = path.join(workspaceDir, params.memoryFlushWritePath!);
+          await fs.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.writeFile(targetPath, "existing line", "utf-8");
+          return {
+            payloads: [{ text: "tool or model error", isError: true }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.readFile(targetPath, "utf-8")).resolves.toBe("existing line");
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeUndefined();
+      expect(stored[sessionKey].memoryFlushCompactionCount).toBeUndefined();
+    });
+  });
+
+  it("does not mark flush complete when append fails", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+      const appendSpy = vi
+        .spyOn(fsSafe, "appendFileWithinRoot")
+        .mockRejectedValue(new Error("disk full"));
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          return {
+            payloads: [{ text: "MEMORY_FLUSH_APPEND:\n- 2026-03-24: durable note" }],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(appendSpy).toHaveBeenCalledTimes(1);
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.stat(targetPath)).rejects.toThrow();
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeUndefined();
+      expect(stored[sessionKey].memoryFlushCompactionCount).toBeUndefined();
+    });
+  });
+
+  it("ignores reasoning-only payloads and treats the flush as a no-op completion", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+      const appendSpy = vi.spyOn(fsSafe, "appendFileWithinRoot");
+
+      let seenVerboseLevel: string | undefined;
+      let seenReasoningLevel: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(
+        async (params: EmbeddedRunParams & { verboseLevel?: string; reasoningLevel?: string }) => {
+          if (params.prompt?.includes("Pre-compaction memory flush.")) {
+            seenVerboseLevel = params.verboseLevel;
+            seenReasoningLevel = params.reasoningLevel;
+            return {
+              payloads: [{ text: "internal reasoning", isReasoning: true }],
+              meta: { agentMeta: { sessionId: "session-rotated" } },
+            };
+          }
+          return {
+            payloads: [{ text: "ok" }],
+            meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+          };
+        },
+      );
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir, verboseLevel: "on", reasoningLevel: "on" },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(seenVerboseLevel).toBe("off");
+      expect(seenReasoningLevel).toBe("off");
+      expect(appendSpy).not.toHaveBeenCalled();
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeTypeOf("number");
+      expect(stored[sessionKey].memoryFlushCompactionCount).toBe(1);
+    });
+  });
+
+  it("fails closed when flush payloads mix error and text", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-memory-flush-"));
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+      const appendSpy = vi.spyOn(fsSafe, "appendFileWithinRoot");
+
+      let memoryFlushWritePath: string | undefined;
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          memoryFlushWritePath = params.memoryFlushWritePath;
+          return {
+            payloads: [
+              { text: "tool warning", isError: true },
+              { text: "MEMORY_FLUSH_APPEND:\n- 2026-03-24: durable note" },
+            ],
+            meta: { agentMeta: { sessionId: "session-rotated" } },
+          };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { workspaceDir },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(memoryFlushWritePath).toMatch(/^memory\/\d{4}-\d{2}-\d{2}\.md$/);
+      expect(appendSpy).not.toHaveBeenCalled();
+      const targetPath = path.join(workspaceDir, memoryFlushWritePath!);
+      await expect(fs.stat(targetPath)).rejects.toThrow();
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeUndefined();
+      expect(stored[sessionKey].memoryFlushCompactionCount).toBeUndefined();
     });
   });
 

@@ -201,7 +201,7 @@ describe("FS tools with workspaceOnly=false", () => {
     ).rejects.toThrow(/Path escapes (workspace|sandbox) root/);
   });
 
-  it("restricts memory-triggered writes to append-only canonical memory files", async () => {
+  it("keeps canonical append-only write available for legacy memory-triggered prompts", async () => {
     const allowedRelativePath = "memory/2026-03-07.md";
     const allowedAbsolutePath = path.join(workspaceDir, allowedRelativePath);
     await fs.mkdir(path.dirname(allowedAbsolutePath), { recursive: true });
@@ -225,7 +225,9 @@ describe("FS tools with workspaceOnly=false", () => {
     });
 
     const writeTool = tools.find((tool) => tool.name === "write");
+    const readTool = tools.find((tool) => tool.name === "read");
     expect(writeTool).toBeDefined();
+    expect(readTool).toBeDefined();
     expect(tools.map((tool) => tool.name).toSorted()).toEqual(["read", "write"]);
 
     await expect(
